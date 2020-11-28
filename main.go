@@ -180,7 +180,10 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 }
 
 func (h *forwardedTCPHandler) ReversePortForwardingCallback(ctx ssh.Context, host string, port uint32) bool {
-	log.Println("attempt to bind", host, port, "granted")
+	_, exists := h.subdomains[host]
+	if exists {
+		return false
+	}
 	return true
 }
 
@@ -227,8 +230,6 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 }
 
 func main() {
-	log.Println("starting ssh server on port 2222...")
-
 	forwardHandler := &forwardedTCPHandler{}
 
 	s := &http.Server{
@@ -239,6 +240,8 @@ func main() {
 		MaxHeaderBytes: 1 << 20,
 	}
 	go func() {
+		log.Println("starting http server on port 8080...")
+
 		log.Fatal(s.ListenAndServe())
 	}()
 
@@ -254,6 +257,8 @@ func main() {
 			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
 		},
 	}
+
+	log.Println("starting ssh server on port 2222...")
 
 	log.Fatal(server.ListenAndServe())
 }
