@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -229,7 +231,86 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	io.Copy(w, resp.Body)
 }
 
+func getPublicKeyHandler() ssh.PublicKeyHandler {
+	authorizedKeysDir := os.Getenv("AUTHORIZED_KEYS_DIR")
+	if authorizedKeysDir == "" {
+		return nil
+	}
+
+	authorizedKeysFiles, err := ioutil.ReadDir(authorizedKeysDir)
+	if err != nil {
+		panic(err)
+	}
+	authorizedUsersKeys := make(map[string][]ssh.PublicKey)
+
+	for _, file := range authorizedKeysFiles {
+		user := file.Name()
+		keys := []ssh.PublicKey{}
+
+		file, err := os.Open(fmt.Sprintf("%s/%s", authorizedKeysDir, user))
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			key, _, _, _, err := ssh.ParseAuthorizedKey(scanner.Bytes())
+			if err != nil {
+				panic(err)
+			}
+			keys = append(keys, key)
+		}
+
+		if err := scanner.Err(); err != nil {
+			log.Fatal(err)
+		}
+
+		authorizedUsersKeys[user] = keys
+	}
+	return func(ctx ssh.Context, key ssh.PublicKey) bool {
+		user := ctx.User()
+		log.Printf("user '%s' attempting to connect with authorized key", user)
+		keys, ok := authorizedUsersKeys[user]
+		if !ok {
+			keys = []ssh.PublicKey{}
+		}
+		authorized := false
+		for _, authKey := range keys {
+			if ssh.KeysEqual(key, authKey) {
+				authorized = true
+				break
+			}
+		}
+		log.Printf("user '%s' authorized: %t", user, authorized)
+		return authorized
+	}
+}
+
+func getPasswordHandler() ssh.PasswordHandler {
+	adminPassword := os.Getenv("ADMIN_PASSWORD")
+	if adminPassword == "" {
+		return nil
+	}
+	return func(ctx ssh.Context, password string) bool {
+		user := ctx.User()
+		log.Printf("user '%s' attempting to connect with password", user)
+		authorized := adminPassword == password
+		log.Printf("user '%s' authorized: %t", user, authorized)
+		return authorized
+	}
+}
+
 func main() {
+	publicKeyHandler := getPublicKeyHandler()
+	passwordHandler := getPasswordHandler()
+
+	log.Printf("using public key auth: %t", publicKeyHandler != nil)
+	log.Printf("using password auth: %t", passwordHandler != nil)
+	if publicKeyHandler == nil && passwordHandler == nil {
+		log.Println("WARNING: not using auth")
+	}
+
 	forwardHandler := &forwardedTCPHandler{}
 
 	s := &http.Server{
@@ -256,6 +337,8 @@ func main() {
 			"tcpip-forward":        forwardHandler.HandleSSHRequest,
 			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
 		},
+		PublicKeyHandler: publicKeyHandler,
+		PasswordHandler:  passwordHandler,
 	}
 
 	log.Println("starting ssh server on port 2222...")
