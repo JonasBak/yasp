@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 )
@@ -40,15 +41,20 @@ func socketFileName(sessionID string) string {
 	return fmt.Sprintf("/tmp/yasp-%s", sessionID)
 }
 
+type session struct {
+	ln         net.Listener
+	socketFile string
+}
+
 type forwardedTCPHandler struct {
-	forwards map[string]net.Listener
+	forwards map[string]session
 	sync.Mutex
 }
 
 func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
 	h.Lock()
 	if h.forwards == nil {
-		h.forwards = make(map[string]net.Listener)
+		h.forwards = make(map[string]session)
 	}
 	h.Unlock()
 	conn := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn)
@@ -62,35 +68,33 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			// TODO: log parse failure
 			return false, []byte{}
 		}
-		// reqPayload.BindPort = 1231
 		if srv.ReversePortForwardingCallback == nil {
 			return false, []byte("port forwarding is disabled")
 		}
 		if !srv.ReversePortForwardingCallback(ctx, reqPayload.BindAddr, reqPayload.BindPort) {
 			return false, []byte("port forwarding failed")
 		}
-		// addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
 		socketFile := socketFileName(sessionID)
 		ln, err := net.Listen("unix", socketFile)
 		if err != nil {
 			// TODO: log listen failure
 			return false, []byte{}
 		}
-		// _, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
-		// destPort, _ := strconv.Atoi(destPortStr)
 		destPort := reqPayload.BindPort
-		println("destPort")
-		println(destPort)
 		h.Lock()
-		h.forwards[sessionID] = ln
+		h.forwards[sessionID] = session{
+			ln,
+			socketFile,
+		}
 		h.Unlock()
 		go func() {
 			<-ctx.Done()
 			h.Lock()
-			ln, ok := h.forwards[sessionID]
+			session, ok := h.forwards[sessionID]
 			h.Unlock()
 			if ok {
-				ln.Close()
+				session.ln.Close()
+				os.Remove(session.socketFile)
 			}
 		}()
 		go func() {
@@ -102,10 +106,6 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 				}
 				originAddr, orignPortStr, _ := net.SplitHostPort(c.RemoteAddr().String())
 				originPort, _ := strconv.Atoi(orignPortStr)
-				println("originPort")
-				println(originPort)
-				println("reqPayload.BindAddr")
-				println(reqPayload.BindAddr)
 				payload := gossh.Marshal(&remoteForwardChannelData{
 					DestAddr:   reqPayload.BindAddr,
 					DestPort:   uint32(destPort),
@@ -145,17 +145,22 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			// TODO: log parse failure
 			return false, []byte{}
 		}
-		// addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
 		h.Lock()
-		ln, ok := h.forwards[sessionID]
+		session, ok := h.forwards[sessionID]
 		h.Unlock()
 		if ok {
-			ln.Close()
+			session.ln.Close()
+			os.Remove(session.socketFile)
 		}
 		return true, nil
 	default:
 		return false, nil
 	}
+}
+
+func (h *forwardedTCPHandler) ReversePortForwardingCallback(ctx ssh.Context, host string, port uint32) bool {
+	log.Println("attempt to bind", host, port, "granted")
+	return true
 }
 
 func main() {
@@ -169,10 +174,7 @@ func main() {
 			io.WriteString(s, "Remote forwarding available...\n")
 			select {}
 		}),
-		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
-			log.Println("attempt to bind", host, port, "granted")
-			return true
-		}),
+		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(forwardHandler.ReversePortForwardingCallback),
 		RequestHandlers: map[string]ssh.RequestHandler{
 			"tcpip-forward":        forwardHandler.HandleSSHRequest,
 			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
