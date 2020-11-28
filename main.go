@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -44,10 +48,12 @@ func socketFileName(sessionID string) string {
 type session struct {
 	ln         net.Listener
 	socketFile string
+	subdomain  string
 }
 
 type forwardedTCPHandler struct {
-	forwards map[string]session
+	forwards   map[string]session
+	subdomains map[string]string
 	sync.Mutex
 }
 
@@ -55,6 +61,9 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 	h.Lock()
 	if h.forwards == nil {
 		h.forwards = make(map[string]session)
+	}
+	if h.subdomains == nil {
+		h.subdomains = make(map[string]string)
 	}
 	h.Unlock()
 	conn := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn)
@@ -74,23 +83,32 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		if !srv.ReversePortForwardingCallback(ctx, reqPayload.BindAddr, reqPayload.BindPort) {
 			return false, []byte("port forwarding failed")
 		}
+		subdomain := reqPayload.BindAddr
+
 		socketFile := socketFileName(sessionID)
 		ln, err := net.Listen("unix", socketFile)
 		if err != nil {
 			// TODO: log listen failure
 			return false, []byte{}
 		}
+
 		destPort := reqPayload.BindPort
+
 		h.Lock()
 		h.forwards[sessionID] = session{
 			ln,
 			socketFile,
+			subdomain,
 		}
+		h.subdomains[subdomain] = sessionID
 		h.Unlock()
 		go func() {
 			<-ctx.Done()
 			h.Lock()
 			session, ok := h.forwards[sessionID]
+			if ok {
+				delete(h.subdomains, sessionID)
+			}
 			h.Unlock()
 			if ok {
 				session.ln.Close()
@@ -147,6 +165,9 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		}
 		h.Lock()
 		session, ok := h.forwards[sessionID]
+		if ok {
+			delete(h.subdomains, sessionID)
+		}
 		h.Unlock()
 		if ok {
 			session.ln.Close()
@@ -163,10 +184,63 @@ func (h *forwardedTCPHandler) ReversePortForwardingCallback(ctx ssh.Context, hos
 	return true
 }
 
+func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Request) {
+	subdomain := strings.Split(r.Host, ".")[0]
+	h.Lock()
+	sessionID, ok := h.subdomains[subdomain]
+	var session *session = nil
+	if ok {
+		s, _ := h.forwards[sessionID]
+		session = &s
+	}
+	h.Unlock()
+
+	if session == nil {
+		http.Error(w, fmt.Sprintf("no session on subdomain '%s'", subdomain), http.StatusNotFound)
+		return
+	}
+
+	httpClient := http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", session.socketFile)
+			},
+		},
+	}
+
+	url := fmt.Sprintf("http://%s%s", r.Host, r.RequestURI)
+
+	proxyReq, err := http.NewRequest(r.Method, url, r.Body)
+
+	proxyReq.Header = make(http.Header)
+	for h, val := range r.Header {
+		proxyReq.Header[h] = val
+	}
+
+	resp, err := httpClient.Do(proxyReq)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(w, resp.Body)
+}
+
 func main() {
 	log.Println("starting ssh server on port 2222...")
 
 	forwardHandler := &forwardedTCPHandler{}
+
+	s := &http.Server{
+		Addr:           ":8080",
+		Handler:        http.HandlerFunc(forwardHandler.httpMuxHandler),
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20,
+	}
+	go func() {
+		log.Fatal(s.ListenAndServe())
+	}()
 
 	server := ssh.Server{
 		Addr: ":2222",
