@@ -60,9 +60,10 @@ func logFileName(sessionID string) string {
 }
 
 type session struct {
-	ln         net.Listener
+	socket     net.Listener
 	socketFile string
-	logFile    string
+	pipeR      *os.File
+	pipeW      *os.File
 	subdomain  string
 }
 
@@ -110,23 +111,20 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		subdomain := reqPayload.BindAddr
 
 		socketFile := socketFileName(sessionID)
-		ln, err := net.Listen("unix", socketFile)
+		socket, err := net.Listen("unix", socketFile)
 		if err != nil {
 			// TODO: log listen failure
 			return false, []byte{}
 		}
 
-		logFile := logFileName(sessionID)
-		err = ioutil.WriteFile(logFile, []byte("Log file created...\n"), 0755)
-		if err != nil {
-			fmt.Printf("unable to create log file: %v", err)
-		}
+		pipeR, pipeW, _ := os.Pipe()
 
 		h.Lock()
 		h.forwards[sessionID] = session{
-			ln,
+			socket,
 			socketFile,
-			logFile,
+			pipeR,
+			pipeW,
 			subdomain,
 		}
 		h.subdomains[subdomain] = sessionID
@@ -135,19 +133,23 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			<-ctx.Done()
 			h.Lock()
 			session, ok := h.forwards[sessionID]
-			h.Unlock()
 			if ok {
-				session.ln.Close()
+				session.socket.Close()
+				session.pipeR.Close()
+				session.pipeW.Close()
 				os.Remove(session.socketFile)
-				os.Remove(session.logFile)
+				delete(h.forwards, sessionID)
+				delete(h.subdomains, subdomain)
 			}
+			log.Printf("cleaned up after %s", sessionID)
+			h.Unlock()
 		}()
 
 		destPort := reqPayload.BindPort
 
 		go func() {
 			for {
-				c, err := ln.Accept()
+				c, err := socket.Accept()
 				if err != nil {
 					// TODO: log accept failure
 					break
@@ -163,7 +165,6 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 				go func() {
 					ch, reqs, err := conn.OpenChannel(forwardedTCPChannelType, payload)
 					if err != nil {
-						// TODO: log failure to open channel
 						log.Println(err)
 						c.Close()
 						return
@@ -181,10 +182,6 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 					}()
 				}()
 			}
-			h.Lock()
-			delete(h.forwards, sessionID)
-			delete(h.subdomains, subdomain)
-			h.Unlock()
 		}()
 
 		onCreate <- struct{}{}
@@ -200,14 +197,14 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		h.Lock()
 		session, ok := h.forwards[sessionID]
 		if ok {
-			delete(h.subdomains, sessionID)
+			session.socket.Close()
+			session.pipeR.Close()
+			session.pipeW.Close()
+			os.Remove(session.socketFile)
+			delete(h.forwards, sessionID)
+			delete(h.subdomains, session.subdomain)
 		}
 		h.Unlock()
-		if ok {
-			session.ln.Close()
-			os.Remove(session.socketFile)
-			os.Remove(session.logFile)
-		}
 		return true, nil
 	default:
 		return false, nil
@@ -220,19 +217,6 @@ func (h *forwardedTCPHandler) ReversePortForwardingCallback(ctx ssh.Context, hos
 		return false
 	}
 	return true
-}
-
-func appendToFile(file, text string) {
-	f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0755)
-	defer f.Close()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	_, err = f.Write([]byte(text))
-	if err != nil {
-		log.Fatal(err)
-	}
 }
 
 func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Request) {
@@ -251,7 +235,10 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	appendToFile(session.logFile, fmt.Sprintf("request: %s\n", r.Host))
+	fmt.Fprintf(session.pipeW, "request: %s\n", r.Host)
+
+	// TODO client hangson exit if there has been requests
+	// context doesn't close
 
 	httpClient := http.Client{
 		Transport: &http.Transport{
@@ -383,8 +370,8 @@ func main() {
 	server := ssh.Server{
 		Addr: ":2222",
 		Handler: ssh.Handler(func(s ssh.Session) {
-			log.Printf("started session for %s", s.User())
 			sessionID := s.Context().(ssh.Context).SessionID()
+			log.Printf("started session for %s - %s", s.User(), sessionID)
 
 			forwardHandler.Lock()
 			if forwardHandler.onCreate == nil {
@@ -402,7 +389,11 @@ func main() {
 
 			session, _ := forwardHandler.forwards[s.Context().(ssh.Context).SessionID()]
 
-			cmd := exec.Command("./yasp", "--tui", "--log-file", session.logFile)
+			cmd := exec.Command(os.Args[0], "--tui", "--url", session.subdomain)
+			cmd.ExtraFiles = []*os.File{
+				session.pipeR,
+				session.pipeW,
+			}
 			ptyReq, winCh, isPty := s.Pty()
 			if isPty {
 				cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
@@ -420,8 +411,7 @@ func main() {
 				}()
 				io.Copy(s, f) // stdout
 				s.Close()
-				// TODO client hangs on exit if there has been requests
-				log.Printf("ended session for %s", s.User())
+				log.Printf("ended session for %s - %s", s.User(), sessionID)
 			} else {
 				io.WriteString(s, "No PTY requested.\n")
 				s.Exit(1)
