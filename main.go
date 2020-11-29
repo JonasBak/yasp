@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
 	"github.com/jonasbak/yasp/tui"
+	"github.com/jonasbak/yasp/utils"
 	gossh "golang.org/x/crypto/ssh"
 	"io"
 	"io/ioutil"
@@ -65,6 +67,8 @@ type session struct {
 	pipeR      *os.File
 	pipeW      *os.File
 	subdomain  string
+
+	settings utils.SessionSettings
 }
 
 type forwardedTCPHandler struct {
@@ -118,6 +122,7 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		}
 
 		pipeR, pipeW, _ := os.Pipe()
+		settings := utils.DefaultSettings()
 
 		h.Lock()
 		h.forwards[sessionID] = session{
@@ -126,6 +131,7 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			pipeR,
 			pipeW,
 			subdomain,
+			settings,
 		}
 		h.subdomains[subdomain] = sessionID
 		h.Unlock()
@@ -235,6 +241,11 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if !session.settings.Traffic {
+		http.Error(w, "session has blocked traffic", http.StatusForbidden)
+		return
+	}
+
 	// TODO client hangson exit if there has been requests
 	// context doesn't close
 
@@ -257,7 +268,7 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 
 	resp, err := httpClient.Do(proxyReq)
 
-	fmt.Fprintf(session.pipeW, "%s - %s %s %s - %d\n", r.RemoteAddr, r.Method, r.Host, r.URL.Path, resp.StatusCode)
+	fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - %d\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path, resp.StatusCode)
 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -337,6 +348,33 @@ func getPasswordHandler() ssh.PasswordHandler {
 	}
 }
 
+func readMessages(stderr io.ReadCloser, setSettings func(utils.SessionSettings)) {
+	r := bufio.NewReader(stderr)
+	for {
+		line, err := r.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			panic(err)
+		}
+		if len(line) > 0 {
+			lineStr := string(line)
+			if strings.HasPrefix(lineStr, utils.SETTINGS_MSG_PREFIX) {
+				settings := utils.SessionSettings{}
+				err := json.Unmarshal(line[len(utils.SETTINGS_MSG_PREFIX):], &settings)
+				if err != nil {
+					log.Println("could not parse settings")
+				} else {
+					setSettings(settings)
+				}
+			} else {
+				log.Println("could not parse last message")
+			}
+		}
+		if err == io.EOF {
+			return
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
 	if *runTui {
@@ -371,6 +409,12 @@ func main() {
 	server := ssh.Server{
 		Addr: ":2222",
 		Handler: ssh.Handler(func(s ssh.Session) {
+			ptyReq, winCh, isPty := s.Pty()
+			if !isPty {
+				io.WriteString(s, "No PTY requested.\n")
+				s.Exit(1)
+			}
+
 			sessionID := s.Context().(ssh.Context).SessionID()
 			log.Printf("started session for %s - %s", s.User(), sessionID)
 
@@ -388,35 +432,49 @@ func main() {
 			// TODO timeout
 			<-onCreate
 
-			session, _ := forwardHandler.forwards[s.Context().(ssh.Context).SessionID()]
+			session, _ := forwardHandler.forwards[sessionID]
 
 			cmd := exec.Command(os.Args[0], "--tui", "--forward-url", session.subdomain)
 			cmd.ExtraFiles = []*os.File{
 				session.pipeR,
-				session.pipeW,
 			}
-			ptyReq, winCh, isPty := s.Pty()
-			if isPty {
-				cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
-				f, err := pty.Start(cmd)
-				if err != nil {
-					panic(err)
+			cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
+			stderr, err := cmd.StderrPipe()
+			if err != nil {
+				panic(err)
+			}
+			f, err := pty.Start(cmd)
+			if err != nil {
+				panic(err)
+			}
+
+			writeSettings := func() {
+				settingsStr, _ := json.Marshal(session.settings)
+				fmt.Fprintf(session.pipeW, "%s%s\n", utils.SETTINGS_MSG_PREFIX, settingsStr)
+			}
+
+			go writeSettings()
+			go readMessages(stderr, func(s utils.SessionSettings) {
+				session.settings = s
+				forwardHandler.Lock()
+				_, ok := forwardHandler.forwards[sessionID]
+				if ok {
+					forwardHandler.forwards[sessionID] = session
 				}
-				go func() {
-					for win := range winCh {
-						setWinsize(f, win.Width, win.Height)
-					}
-				}()
-				go func() {
-					io.Copy(f, s) // stdin
-				}()
-				io.Copy(s, f) // stdout
-				s.Close()
-				log.Printf("ended session for %s - %s", s.User(), sessionID)
-			} else {
-				io.WriteString(s, "No PTY requested.\n")
-				s.Exit(1)
-			}
+				forwardHandler.Unlock()
+				writeSettings()
+			})
+			go func() {
+				for win := range winCh {
+					setWinsize(f, win.Width, win.Height)
+				}
+			}()
+			go func() {
+				io.Copy(f, s) // stdin
+			}()
+			io.Copy(s, f) // stdout
+			s.Close()
+			log.Printf("ended session for %s - %s", s.User(), sessionID)
 		}),
 		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(forwardHandler.ReversePortForwardingCallback),
 		RequestHandlers: map[string]ssh.RequestHandler{
