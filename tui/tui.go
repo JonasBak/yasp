@@ -63,12 +63,16 @@ func Run() {
 		SetItemPadding(1).
 		SetLabelColor(tcell.ColorWhite).
 		SetFieldBackgroundColor(tcell.ColorGray).
-		AddCheckbox("Allow traffic", true, func(c bool) {
+		AddCheckbox("Block traffic", false, func(c bool) {
 			s := settings
-			s.Traffic = c
+			s.Block = c
 			setSettings(s)
 		}).
-		AddPasswordField("Password", "", 10, '*', nil)
+		AddPasswordField("Password", "", 10, '*', func(p string) {
+			s := settings
+			s.Password = p
+			setSettings(s)
+		})
 
 	infoView := tview.NewTextView().
 		SetDynamicColors(true).
@@ -81,7 +85,7 @@ func Run() {
 
 	setStatusText := func() {
 		trafficText := "[green]open"
-		if !settings.Traffic {
+		if settings.Block {
 			trafficText = "[red]blocked"
 		} else if settings.Password != "" {
 			trafficText = "[yellow]auth"

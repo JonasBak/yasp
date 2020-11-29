@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -73,7 +74,7 @@ type session struct {
 
 type forwardedTCPHandler struct {
 	sync.Mutex
-	forwards   map[string]session
+	sessions   map[string]*session
 	subdomains map[string]string
 	onCreate   map[string]chan struct{}
 }
@@ -82,8 +83,8 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 	sessionID := ctx.SessionID()
 
 	h.Lock()
-	if h.forwards == nil {
-		h.forwards = make(map[string]session)
+	if h.sessions == nil {
+		h.sessions = make(map[string]*session)
 	}
 	if h.subdomains == nil {
 		h.subdomains = make(map[string]string)
@@ -125,7 +126,7 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		settings := utils.DefaultSettings()
 
 		h.Lock()
-		h.forwards[sessionID] = session{
+		h.sessions[sessionID] = &session{
 			socket,
 			socketFile,
 			pipeR,
@@ -138,13 +139,13 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		go func() {
 			<-ctx.Done()
 			h.Lock()
-			session, ok := h.forwards[sessionID]
+			session, ok := h.sessions[sessionID]
 			if ok {
 				session.socket.Close()
 				session.pipeR.Close()
 				session.pipeW.Close()
 				os.Remove(session.socketFile)
-				delete(h.forwards, sessionID)
+				delete(h.sessions, sessionID)
 				delete(h.subdomains, subdomain)
 			}
 			log.Printf("cleaned up after %s", sessionID)
@@ -201,13 +202,13 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			return false, []byte{}
 		}
 		h.Lock()
-		session, ok := h.forwards[sessionID]
+		session, ok := h.sessions[sessionID]
 		if ok {
 			session.socket.Close()
 			session.pipeR.Close()
 			session.pipeW.Close()
 			os.Remove(session.socketFile)
-			delete(h.forwards, sessionID)
+			delete(h.sessions, sessionID)
 			delete(h.subdomains, session.subdomain)
 		}
 		h.Unlock()
@@ -231,8 +232,8 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	sessionID, ok := h.subdomains[subdomain]
 	var session *session = nil
 	if ok {
-		s, _ := h.forwards[sessionID]
-		session = &s
+		s, _ := h.sessions[sessionID]
+		session = s
 	}
 	h.Unlock()
 
@@ -241,9 +242,25 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if !session.settings.Traffic {
+	if session.settings.Block {
 		http.Error(w, "session has blocked traffic", http.StatusForbidden)
+
+		fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - [red]blocked[white]\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path)
+
 		return
+	}
+
+	if correctPass := session.settings.Password; len(correctPass) > 0 {
+		user, pass, ok := r.BasicAuth()
+		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte("yasp")) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(correctPass)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="yeet"`)
+			w.WriteHeader(401)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+
+			fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - [yellow]unauthorized[white]\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path)
+
+			return
+		}
 	}
 
 	// TODO client hangson exit if there has been requests
@@ -432,7 +449,7 @@ func main() {
 			// TODO timeout
 			<-onCreate
 
-			session, _ := forwardHandler.forwards[sessionID]
+			session, _ := forwardHandler.sessions[sessionID]
 
 			cmd := exec.Command(os.Args[0], "--tui", "--forward-url", session.subdomain)
 			cmd.ExtraFiles = []*os.File{
@@ -456,12 +473,6 @@ func main() {
 			go writeSettings()
 			go readMessages(stderr, func(s utils.SessionSettings) {
 				session.settings = s
-				forwardHandler.Lock()
-				_, ok := forwardHandler.forwards[sessionID]
-				if ok {
-					forwardHandler.forwards[sessionID] = session
-				}
-				forwardHandler.Unlock()
 				writeSettings()
 			})
 			go func() {
@@ -473,7 +484,7 @@ func main() {
 				io.Copy(f, s) // stdin
 			}()
 			io.Copy(s, f) // stdout
-			s.Close()
+			s.Exit(0)
 			log.Printf("ended session for %s - %s", s.User(), sessionID)
 		}),
 		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(forwardHandler.ReversePortForwardingCallback),

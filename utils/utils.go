@@ -6,13 +6,13 @@ const (
 )
 
 type SessionSettings struct {
-	Traffic  bool
+	Block    bool
 	Password string
 }
 
 func DefaultSettings() SessionSettings {
 	return SessionSettings{
-		Traffic:  true,
+		Block:    false,
 		Password: "",
 	}
 }
