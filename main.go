@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
+	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
+	"github.com/jonasbak/yasp/tui"
 	gossh "golang.org/x/crypto/ssh"
 	"io"
 	"io/ioutil"
@@ -12,11 +15,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 )
+
+var runTui = flag.Bool("tui", false, "run the client TUI")
 
 const (
 	forwardedTCPChannelType = "forwarded-tcpip"
@@ -44,22 +52,30 @@ type remoteForwardChannelData struct {
 }
 
 func socketFileName(sessionID string) string {
-	return fmt.Sprintf("/tmp/yasp-%s", sessionID)
+	return fmt.Sprintf("/tmp/yasp-%s.sock", sessionID)
+}
+
+func logFileName(sessionID string) string {
+	return fmt.Sprintf("/tmp/yasp-%s.log", sessionID)
 }
 
 type session struct {
 	ln         net.Listener
 	socketFile string
+	logFile    string
 	subdomain  string
 }
 
 type forwardedTCPHandler struct {
+	sync.Mutex
 	forwards   map[string]session
 	subdomains map[string]string
-	sync.Mutex
+	onCreate   map[string]chan struct{}
 }
 
 func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
+	sessionID := ctx.SessionID()
+
 	h.Lock()
 	if h.forwards == nil {
 		h.forwards = make(map[string]session)
@@ -67,10 +83,16 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 	if h.subdomains == nil {
 		h.subdomains = make(map[string]string)
 	}
+	if h.onCreate == nil {
+		h.onCreate = make(map[string]chan struct{})
+	}
+	onCreate, ok := h.onCreate[sessionID]
+	if !ok {
+		onCreate = make(chan struct{})
+		h.onCreate[sessionID] = onCreate
+	}
 	h.Unlock()
 	conn := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn)
-
-	sessionID := ctx.SessionID()
 
 	switch req.Type {
 	case "tcpip-forward":
@@ -94,12 +116,17 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			return false, []byte{}
 		}
 
-		destPort := reqPayload.BindPort
+		logFile := logFileName(sessionID)
+		err = ioutil.WriteFile(logFile, []byte("Log file created...\n"), 0755)
+		if err != nil {
+			fmt.Printf("unable to create log file: %v", err)
+		}
 
 		h.Lock()
 		h.forwards[sessionID] = session{
 			ln,
 			socketFile,
+			logFile,
 			subdomain,
 		}
 		h.subdomains[subdomain] = sessionID
@@ -108,15 +135,16 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			<-ctx.Done()
 			h.Lock()
 			session, ok := h.forwards[sessionID]
-			if ok {
-				delete(h.subdomains, sessionID)
-			}
 			h.Unlock()
 			if ok {
 				session.ln.Close()
 				os.Remove(session.socketFile)
+				os.Remove(session.logFile)
 			}
 		}()
+
+		destPort := reqPayload.BindPort
+
 		go func() {
 			for {
 				c, err := ln.Accept()
@@ -155,8 +183,12 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			}
 			h.Lock()
 			delete(h.forwards, sessionID)
+			delete(h.subdomains, subdomain)
 			h.Unlock()
 		}()
+
+		onCreate <- struct{}{}
+
 		return true, gossh.Marshal(&remoteForwardSuccess{uint32(destPort)})
 
 	case "cancel-tcpip-forward":
@@ -174,6 +206,7 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		if ok {
 			session.ln.Close()
 			os.Remove(session.socketFile)
+			os.Remove(session.logFile)
 		}
 		return true, nil
 	default:
@@ -187,6 +220,19 @@ func (h *forwardedTCPHandler) ReversePortForwardingCallback(ctx ssh.Context, hos
 		return false
 	}
 	return true
+}
+
+func appendToFile(file, text string) {
+	f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0755)
+	defer f.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = f.Write([]byte(text))
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +250,8 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 		http.Error(w, fmt.Sprintf("no session on subdomain '%s'", subdomain), http.StatusNotFound)
 		return
 	}
+
+	appendToFile(session.logFile, fmt.Sprintf("request: %s\n", r.Host))
 
 	httpClient := http.Client{
 		Transport: &http.Transport{
@@ -302,6 +350,12 @@ func getPasswordHandler() ssh.PasswordHandler {
 }
 
 func main() {
+	flag.Parse()
+	if *runTui {
+		tui.Run()
+		return
+	}
+
 	publicKeyHandler := getPublicKeyHandler()
 	passwordHandler := getPasswordHandler()
 
@@ -329,8 +383,49 @@ func main() {
 	server := ssh.Server{
 		Addr: ":2222",
 		Handler: ssh.Handler(func(s ssh.Session) {
-			io.WriteString(s, "Remote forwarding available...\n")
-			select {}
+			log.Printf("started session for %s", s.User())
+			sessionID := s.Context().(ssh.Context).SessionID()
+
+			forwardHandler.Lock()
+			if forwardHandler.onCreate == nil {
+				forwardHandler.onCreate = make(map[string]chan struct{})
+			}
+			onCreate, ok := forwardHandler.onCreate[sessionID]
+			if !ok {
+				onCreate = make(chan struct{})
+				forwardHandler.onCreate[sessionID] = onCreate
+			}
+			forwardHandler.Unlock()
+
+			// TODO timeout
+			<-onCreate
+
+			session, _ := forwardHandler.forwards[s.Context().(ssh.Context).SessionID()]
+
+			cmd := exec.Command("./yasp", "--tui", "--log-file", session.logFile)
+			ptyReq, winCh, isPty := s.Pty()
+			if isPty {
+				cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
+				f, err := pty.Start(cmd)
+				if err != nil {
+					panic(err)
+				}
+				go func() {
+					for win := range winCh {
+						setWinsize(f, win.Width, win.Height)
+					}
+				}()
+				go func() {
+					io.Copy(f, s) // stdin
+				}()
+				io.Copy(s, f) // stdout
+				s.Close()
+				// TODO client hangs on exit if there has been requests
+				log.Printf("ended session for %s", s.User())
+			} else {
+				io.WriteString(s, "No PTY requested.\n")
+				s.Exit(1)
+			}
 		}),
 		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(forwardHandler.ReversePortForwardingCallback),
 		RequestHandlers: map[string]ssh.RequestHandler{
@@ -344,4 +439,9 @@ func main() {
 	log.Println("starting ssh server on port 2222...")
 
 	log.Fatal(server.ListenAndServe())
+}
+
+func setWinsize(f *os.File, w, h int) {
+	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
+		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
 }
