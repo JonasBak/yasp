@@ -10,7 +10,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-var url = flag.String("url", "", "")
+var forwardUrl = flag.String("forward-url", "", "")
 var mock = flag.Bool("mock", false, "")
 
 func readLogs(pushLog func(string)) {
@@ -47,7 +47,9 @@ func Run() {
 		SetChangedFunc(func() {
 			app.Draw()
 		})
-	infoView.SetText(fmt.Sprintf("Your url:\n[blue]%s", *url))
+
+	infoView.SetTitle(" Status ").SetBorder(true).SetTitleAlign(tview.AlignLeft)
+	infoView.SetText(fmt.Sprintf("Your url:\n[blue]%s", *forwardUrl))
 
 	textView := tview.NewTextView().
 		SetDynamicColors(true).
@@ -56,12 +58,11 @@ func Run() {
 			app.Draw()
 		})
 
-	textView.SetTitle("Request log").SetTitleAlign(tview.AlignLeft)
+	textView.SetTitle(" Request log ").SetBorder(true).SetTitleAlign(tview.AlignLeft)
 
 	grid := tview.NewGrid().
 		SetRows(5, 0, 3).
 		SetColumns(30, 0, 30).
-		SetBorders(true).
 		AddItem(newPrimitive("TEST"), 0, 0, 1, 2, 0, 0, false).
 		AddItem(infoView, 0, 2, 1, 1, 0, 0, false).
 		AddItem(textView, 1, 0, 2, 3, 0, 0, false)

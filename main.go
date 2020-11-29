@@ -235,8 +235,6 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	fmt.Fprintf(session.pipeW, "request: %s\n", r.Host)
-
 	// TODO client hangson exit if there has been requests
 	// context doesn't close
 
@@ -258,6 +256,9 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	resp, err := httpClient.Do(proxyReq)
+
+	fmt.Fprintf(session.pipeW, "%s - %s %s %s - %d\n", r.RemoteAddr, r.Method, r.Host, r.URL.Path, resp.StatusCode)
+
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -389,7 +390,7 @@ func main() {
 
 			session, _ := forwardHandler.forwards[s.Context().(ssh.Context).SessionID()]
 
-			cmd := exec.Command(os.Args[0], "--tui", "--url", session.subdomain)
+			cmd := exec.Command(os.Args[0], "--tui", "--forward-url", session.subdomain)
 			cmd.ExtraFiles = []*os.File{
 				session.pipeR,
 				session.pipeW,
