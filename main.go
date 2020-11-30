@@ -31,6 +31,7 @@ import (
 )
 
 var runTui = flag.Bool("tui", false, "run the client TUI")
+var colorRegex = regexp.MustCompile(`\[(.+?)\]`)
 
 const (
 	forwardedTCPChannelType = "forwarded-tcpip"
@@ -282,6 +283,97 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	io.Copy(w, resp.Body)
 }
 
+func (h *forwardedTCPHandler) sshHandler(s ssh.Session) {
+	serviceURL := os.Getenv("SERVICE_URL")
+	if serviceURL == "" {
+		serviceURL = "localhost:8080"
+	}
+
+	ptyReq, winCh, isPty := s.Pty()
+
+	sessionID := s.Context().(ssh.Context).SessionID()
+	log.Printf("started session for %s - %s", s.User(), sessionID)
+	defer log.Printf("ended session for %s - %s", s.User(), sessionID)
+
+	h.Lock()
+	if h.onCreate == nil {
+		h.onCreate = make(map[string]chan struct{})
+	}
+	onCreate, ok := h.onCreate[sessionID]
+	if !ok {
+		onCreate = make(chan struct{})
+		h.onCreate[sessionID] = onCreate
+	}
+	h.Unlock()
+
+	// TODO timeout
+	<-onCreate
+
+	session, _ := h.sessions[sessionID]
+
+	if s, err := utils.ParseSettings(session.settings, isPty, s.Command()); err != nil {
+		session.pushError(err)
+	} else {
+		session.settings = s
+	}
+
+	if len(session.errors) > 0 {
+		fmt.Fprintln(s, "Failed to connect:")
+		for _, err := range session.errors {
+			fmt.Fprintln(s, err.Error())
+		}
+		s.Exit(1)
+		return
+	}
+
+	if !isPty {
+		fmt.Fprintf(s, "Sharing connection on: %s.%s\n", session.settings.Subdomain, serviceURL)
+		if len(session.settings.Password) > 0 {
+			fmt.Fprintf(s, "Using password authentication\n")
+		}
+		fmt.Fprintf(s, "Request log:\n")
+		readLog(session.pipeR, func(log string) {
+			fmt.Fprintf(s, colorRegex.ReplaceAllString(log, ""))
+		})
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "--tui", "--service-url", serviceURL)
+	cmd.ExtraFiles = []*os.File{
+		session.pipeR,
+	}
+	cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		panic(err)
+	}
+	f, err := pty.Start(cmd)
+	if err != nil {
+		panic(err)
+	}
+
+	writeSettings := func() {
+		settingsStr, _ := json.Marshal(session.settings)
+		fmt.Fprintf(session.pipeW, "%s%s\n", utils.SETTINGS_MSG_PREFIX, settingsStr)
+	}
+
+	go writeSettings()
+	go readMessages(stderr, func(s utils.SessionSettings) {
+		session.settings = s
+		writeSettings()
+	})
+	go func() {
+		for win := range winCh {
+			setWinsize(f, win.Width, win.Height)
+		}
+	}()
+	go func() {
+		io.Copy(f, s) // stdin
+	}()
+	io.Copy(s, f) // stdout
+	s.Exit(0)
+}
+
 func getPublicKeyHandler() ssh.PublicKeyHandler {
 	authorizedKeysDir := os.Getenv("AUTHORIZED_KEYS_DIR")
 	if authorizedKeysDir == "" {
@@ -404,12 +496,7 @@ func main() {
 		return
 	}
 
-	serviceURL := os.Getenv("SERVICE_URL")
-	if serviceURL == "" {
-		serviceURL = "localhost:8080"
-	}
-
-	colorRegex := regexp.MustCompile(`\[(.+?)\]`)
+	keyLocation := os.Getenv("KEY_LOCATION")
 
 	publicKeyHandler := getPublicKeyHandler()
 	passwordHandler := getPasswordHandler()
@@ -436,98 +523,20 @@ func main() {
 	}()
 
 	server := ssh.Server{
-		Addr: ":2222",
-		Handler: ssh.Handler(func(s ssh.Session) {
-			ptyReq, winCh, isPty := s.Pty()
-
-			sessionID := s.Context().(ssh.Context).SessionID()
-			log.Printf("started session for %s - %s", s.User(), sessionID)
-			defer log.Printf("ended session for %s - %s", s.User(), sessionID)
-
-			forwardHandler.Lock()
-			if forwardHandler.onCreate == nil {
-				forwardHandler.onCreate = make(map[string]chan struct{})
-			}
-			onCreate, ok := forwardHandler.onCreate[sessionID]
-			if !ok {
-				onCreate = make(chan struct{})
-				forwardHandler.onCreate[sessionID] = onCreate
-			}
-			forwardHandler.Unlock()
-
-			// TODO timeout
-			<-onCreate
-
-			session, _ := forwardHandler.sessions[sessionID]
-
-			if s, err := utils.ParseSettings(session.settings, isPty, s.Command()); err != nil {
-				session.pushError(err)
-			} else {
-				session.settings = s
-			}
-
-			if len(session.errors) > 0 {
-				fmt.Fprintln(s, "Failed to connect:")
-				for _, err := range session.errors {
-					fmt.Fprintln(s, err.Error())
-				}
-				s.Exit(1)
-				return
-			}
-
-			if !isPty {
-				fmt.Fprintf(s, "Sharing connection on: %s.%s\n", session.settings.Subdomain, serviceURL)
-				if len(session.settings.Password) > 0 {
-					fmt.Fprintf(s, "Using password authentication\n")
-				}
-				fmt.Fprintf(s, "Request log:\n")
-				readLog(session.pipeR, func(log string) {
-					fmt.Fprintf(s, colorRegex.ReplaceAllString(log, ""))
-				})
-				return
-			}
-
-			cmd := exec.Command(os.Args[0], "--tui", "--service-url", serviceURL)
-			cmd.ExtraFiles = []*os.File{
-				session.pipeR,
-			}
-			cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
-			stderr, err := cmd.StderrPipe()
-			if err != nil {
-				panic(err)
-			}
-			f, err := pty.Start(cmd)
-			if err != nil {
-				panic(err)
-			}
-
-			writeSettings := func() {
-				settingsStr, _ := json.Marshal(session.settings)
-				fmt.Fprintf(session.pipeW, "%s%s\n", utils.SETTINGS_MSG_PREFIX, settingsStr)
-			}
-
-			go writeSettings()
-			go readMessages(stderr, func(s utils.SessionSettings) {
-				session.settings = s
-				writeSettings()
-			})
-			go func() {
-				for win := range winCh {
-					setWinsize(f, win.Width, win.Height)
-				}
-			}()
-			go func() {
-				io.Copy(f, s) // stdin
-			}()
-			io.Copy(s, f) // stdout
-			s.Exit(0)
-		}),
+		Addr:    ":2222",
+		Handler: ssh.Handler(forwardHandler.sshHandler),
 		RequestHandlers: map[string]ssh.RequestHandler{
 			"tcpip-forward":        forwardHandler.HandleSSHRequest,
 			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
 		},
 		PublicKeyHandler: publicKeyHandler,
 		PasswordHandler:  passwordHandler,
+	}
+
+	if keyLocation == "" {
+		log.Println("No key location specified, creating new...")
+	} else {
+		server.SetOption(ssh.HostKeyFile(keyLocation))
 	}
 
 	log.Println("starting ssh server on port 2222...")
