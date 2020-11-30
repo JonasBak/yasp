@@ -536,7 +536,11 @@ func main() {
 	if keyLocation == "" {
 		log.Println("No key location specified, creating new...")
 	} else {
-		server.SetOption(ssh.HostKeyFile(keyLocation))
+		if _, err := os.Stat(keyLocation); err == nil {
+			server.SetOption(ssh.HostKeyFile(keyLocation))
+		} else {
+			log.Println("Key location specified but no key found, creating new...")
+		}
 	}
 
 	log.Println("starting ssh server on port 2222...")
