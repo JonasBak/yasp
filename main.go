@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"flag"
@@ -219,33 +220,30 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		panic(err)
 	}
+	defer ch.Close()
+
 	go gossh.DiscardRequests(reqs)
 
-	fmt.Fprintf(session.pipeW, "%s%s - %s %s %s\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path)
-
-	dump, _ := httputil.DumpRequest(r, true)
-	buf := bytes.NewReader(dump)
-
-	hj, _ := w.(http.Hijacker)
-	conn, bufw, _ := hj.Hijack()
-
 	go func() {
+		dump, _ := httputil.DumpRequest(r, true)
+		buf := bytes.NewReader(dump)
 		io.Copy(ch, buf)
-		for {
-			one := make([]byte, 1)
-			if n, err := bufw.Read(one); err == io.EOF {
-				if n > 0 {
-					log.Printf("WARNING: Fix %d", n)
-				}
-				ch.Close()
-				break
-			}
-		}
 	}()
+	buf := bufio.NewReader(ch)
+	resp, err := http.ReadResponse(buf, r)
+	if err != nil {
+		panic(err)
+	}
 
-	defer conn.Close()
-	defer ch.Close()
-	io.Copy(bufw, ch)
+	fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - %d\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path, resp.StatusCode)
+
+	for h, vals := range resp.Header {
+		for _, val := range vals {
+			w.Header().Add(h, val)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func getPublicKeyHandler() ssh.PublicKeyHandler {
@@ -345,6 +343,19 @@ func readMessages(stderr io.ReadCloser, setSettings func(utils.SessionSettings))
 	}
 }
 
+type contextKey struct {
+	key string
+}
+
+var ConnContextKey = &contextKey{"http-conn"}
+
+func SaveConnInContext(ctx context.Context, c net.Conn) context.Context {
+	return context.WithValue(ctx, ConnContextKey, c)
+}
+func GetConn(r *http.Request) net.Conn {
+	return r.Context().Value(ConnContextKey).(net.Conn)
+}
+
 func main() {
 	flag.Parse()
 	if *runTui {
@@ -369,6 +380,7 @@ func main() {
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,
 		MaxHeaderBytes: 1 << 20,
+		ConnContext:    SaveConnInContext,
 	}
 	go func() {
 		log.Println("starting http server on port 8080...")
