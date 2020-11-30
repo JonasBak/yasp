@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"context"
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"flag"
@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"os/exec"
 	"strconv"
@@ -54,20 +55,11 @@ type remoteForwardChannelData struct {
 	OriginPort uint32
 }
 
-func socketFileName(sessionID string) string {
-	return fmt.Sprintf("/tmp/yasp-%s.sock", sessionID)
-}
-
-func logFileName(sessionID string) string {
-	return fmt.Sprintf("/tmp/yasp-%s.log", sessionID)
-}
-
 type session struct {
-	socket     net.Listener
-	socketFile string
-	pipeR      *os.File
-	pipeW      *os.File
-	subdomain  string
+	conn      *gossh.ServerConn
+	pipeR     *os.File
+	pipeW     *os.File
+	subdomain string
 
 	settings utils.SessionSettings
 }
@@ -115,20 +107,12 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		}
 		subdomain := reqPayload.BindAddr
 
-		socketFile := socketFileName(sessionID)
-		socket, err := net.Listen("unix", socketFile)
-		if err != nil {
-			// TODO: log listen failure
-			return false, []byte{}
-		}
-
 		pipeR, pipeW, _ := os.Pipe()
 		settings := utils.DefaultSettings()
 
 		h.Lock()
 		h.sessions[sessionID] = &session{
-			socket,
-			socketFile,
+			conn,
 			pipeR,
 			pipeW,
 			subdomain,
@@ -141,10 +125,8 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			h.Lock()
 			session, ok := h.sessions[sessionID]
 			if ok {
-				session.socket.Close()
 				session.pipeR.Close()
 				session.pipeW.Close()
-				os.Remove(session.socketFile)
 				delete(h.sessions, sessionID)
 				delete(h.subdomains, subdomain)
 			}
@@ -153,43 +135,6 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		}()
 
 		destPort := reqPayload.BindPort
-
-		go func() {
-			for {
-				c, err := socket.Accept()
-				if err != nil {
-					// TODO: log accept failure
-					break
-				}
-				originAddr, orignPortStr, _ := net.SplitHostPort(c.RemoteAddr().String())
-				originPort, _ := strconv.Atoi(orignPortStr)
-				payload := gossh.Marshal(&remoteForwardChannelData{
-					DestAddr:   reqPayload.BindAddr,
-					DestPort:   uint32(destPort),
-					OriginAddr: originAddr,
-					OriginPort: uint32(originPort),
-				})
-				go func() {
-					ch, reqs, err := conn.OpenChannel(forwardedTCPChannelType, payload)
-					if err != nil {
-						log.Println(err)
-						c.Close()
-						return
-					}
-					go gossh.DiscardRequests(reqs)
-					go func() {
-						defer ch.Close()
-						defer c.Close()
-						io.Copy(ch, c)
-					}()
-					go func() {
-						defer ch.Close()
-						defer c.Close()
-						io.Copy(c, ch)
-					}()
-				}()
-			}
-		}()
 
 		onCreate <- struct{}{}
 
@@ -204,10 +149,8 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		h.Lock()
 		session, ok := h.sessions[sessionID]
 		if ok {
-			session.socket.Close()
 			session.pipeR.Close()
 			session.pipeW.Close()
-			os.Remove(session.socketFile)
 			delete(h.sessions, sessionID)
 			delete(h.subdomains, session.subdomain)
 		}
@@ -263,36 +206,46 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// TODO client hangson exit if there has been requests
-	// context doesn't close
+	originAddr, orignPortStr, _ := net.SplitHostPort(r.RemoteAddr)
+	originPort, _ := strconv.Atoi(orignPortStr)
+	payload := gossh.Marshal(&remoteForwardChannelData{
+		DestAddr:   session.subdomain,
+		DestPort:   uint32(1232),
+		OriginAddr: originAddr,
+		OriginPort: uint32(originPort),
+	})
 
-	httpClient := http.Client{
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", session.socketFile)
-			},
-		},
-	}
-
-	url := fmt.Sprintf("http://%s%s", r.Host, r.RequestURI)
-
-	proxyReq, err := http.NewRequest(r.Method, url, r.Body)
-
-	proxyReq.Header = make(http.Header)
-	for h, val := range r.Header {
-		proxyReq.Header[h] = val
-	}
-
-	resp, err := httpClient.Do(proxyReq)
-
-	fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - %d\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path, resp.StatusCode)
-
+	ch, reqs, err := session.conn.OpenChannel(forwardedTCPChannelType, payload)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+		panic(err)
 	}
-	defer resp.Body.Close()
-	io.Copy(w, resp.Body)
+	go gossh.DiscardRequests(reqs)
+
+	fmt.Fprintf(session.pipeW, "%s%s - %s %s %s\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path)
+
+	dump, _ := httputil.DumpRequest(r, true)
+	buf := bytes.NewReader(dump)
+
+	hj, _ := w.(http.Hijacker)
+	conn, bufw, _ := hj.Hijack()
+
+	go func() {
+		io.Copy(ch, buf)
+		for {
+			one := make([]byte, 1)
+			if n, err := bufw.Read(one); err == io.EOF {
+				if n > 0 {
+					log.Printf("WARNING: Fix %d", n)
+				}
+				ch.Close()
+				break
+			}
+		}
+	}()
+
+	defer conn.Close()
+	defer ch.Close()
+	io.Copy(bufw, ch)
 }
 
 func getPublicKeyHandler() ssh.PublicKeyHandler {
