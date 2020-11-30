@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"flag"
@@ -343,19 +342,6 @@ func readMessages(stderr io.ReadCloser, setSettings func(utils.SessionSettings))
 	}
 }
 
-type contextKey struct {
-	key string
-}
-
-var ConnContextKey = &contextKey{"http-conn"}
-
-func SaveConnInContext(ctx context.Context, c net.Conn) context.Context {
-	return context.WithValue(ctx, ConnContextKey, c)
-}
-func GetConn(r *http.Request) net.Conn {
-	return r.Context().Value(ConnContextKey).(net.Conn)
-}
-
 func main() {
 	flag.Parse()
 	if *runTui {
@@ -380,7 +366,6 @@ func main() {
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,
 		MaxHeaderBytes: 1 << 20,
-		ConnContext:    SaveConnInContext,
 	}
 	go func() {
 		log.Println("starting http server on port 8080...")
