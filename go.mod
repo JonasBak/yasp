@@ -1,10 +1,9 @@
 module github.com/jonasbak/yasp
 
-replace github.com/gliderlabs/ssh => /home/jonasbak/code/forks/ssh
-
 go 1.15
 
 require (
+	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/creack/pty v1.1.11
 	github.com/gdamore/tcell/v2 v2.0.1-0.20201017141208-acf90d56d591
 	github.com/gliderlabs/ssh v0.3.1

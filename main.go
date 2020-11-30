@@ -20,6 +20,7 @@ import (
 	"net/http/httputil"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -378,6 +379,24 @@ func readMessages(stderr io.ReadCloser, setSettings func(utils.SessionSettings))
 	}
 }
 
+func readLog(pipe io.ReadCloser, pushLog func(string)) {
+	r := bufio.NewReader(pipe)
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(line) > 0 {
+			lineStr := string(line)
+			if strings.HasPrefix(lineStr, utils.LOG_MSG_PREFIX) {
+				pushLog(lineStr[len(utils.LOG_MSG_PREFIX):])
+			} else {
+				log.Printf("could not parse last message: %s", lineStr)
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
 	if *runTui {
@@ -389,6 +408,8 @@ func main() {
 	if serviceURL == "" {
 		serviceURL = "localhost:8080"
 	}
+
+	colorRegex := regexp.MustCompile(`\[(.+?)\]`)
 
 	publicKeyHandler := getPublicKeyHandler()
 	passwordHandler := getPasswordHandler()
@@ -439,10 +460,6 @@ func main() {
 
 			session, _ := forwardHandler.sessions[sessionID]
 
-			if !isPty {
-				session.pushError(fmt.Errorf("Forwarding without pty is not allowed yet"))
-			}
-
 			if s, err := utils.ParseSettings(session.settings, isPty, s.Command()); err != nil {
 				session.pushError(err)
 			} else {
@@ -455,6 +472,18 @@ func main() {
 					fmt.Fprintln(s, err.Error())
 				}
 				s.Exit(1)
+				return
+			}
+
+			if !isPty {
+				fmt.Fprintf(s, "Sharing connection on: %s.%s\n", session.settings.Subdomain, serviceURL)
+				if len(session.settings.Password) > 0 {
+					fmt.Fprintf(s, "Using password authentication\n")
+				}
+				fmt.Fprintf(s, "Request log:\n")
+				readLog(session.pipeR, func(log string) {
+					fmt.Fprintf(s, colorRegex.ReplaceAllString(log, ""))
+				})
 				return
 			}
 
