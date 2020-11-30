@@ -6,13 +6,23 @@ const (
 )
 
 type SessionSettings struct {
-	Block    bool
-	Password string
+	Subdomain string
+	Block     bool
+	Password  string
+}
+
+func DefaultSettingsWithSubdomain(subdomain string) SessionSettings {
+	return SessionSettings{
+		Subdomain: subdomain,
+		Block:     false,
+		Password:  "",
+	}
 }
 
 func DefaultSettings() SessionSettings {
 	return SessionSettings{
-		Block:    false,
-		Password: "",
+		Subdomain: "",
+		Block:     false,
+		Password:  "",
 	}
 }

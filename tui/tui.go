@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-var forwardURL = flag.String("forward-url", "", "")
+var serviceURL = flag.String("service-url", "", "")
 var mock = flag.Bool("mock", false, "")
 
 func readMessages(pushLog func(string), setSettings func(utils.SessionSettings)) {
@@ -90,29 +90,29 @@ func Run() {
 		} else if settings.Password != "" {
 			trafficText = "[yellow]auth"
 		}
-		infoView.SetText(fmt.Sprintf("Your url:\n[blue]%s[white]\nTraffic: %s[white]", *forwardURL, trafficText))
+		infoView.SetText(fmt.Sprintf("Your url:\n[blue]%s.%s[white]\nTraffic: %s[white]", settings.Subdomain, *serviceURL, trafficText))
 	}
 	setStatusText()
 
-	textView := tview.NewTextView().
+	logView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetWordWrap(true).
 		SetChangedFunc(func() {
 			app.Draw()
 		})
 
-	textView.SetTitle(" Request log ").SetBorder(true).SetTitleAlign(tview.AlignLeft)
+	logView.SetTitle(" Request log ").SetBorder(true).SetTitleAlign(tview.AlignLeft)
 
 	grid := tview.NewGrid().
 		SetRows(10, 0, 3).
 		SetColumns(30, 0, 30).
 		AddItem(settingsView, 0, 0, 1, 2, 0, 0, true).
 		AddItem(infoView, 0, 2, 1, 1, 0, 0, false).
-		AddItem(textView, 1, 0, 2, 3, 0, 0, false)
+		AddItem(logView, 1, 0, 2, 3, 0, 0, false)
 
 	pushLog := func(line string) {
-		textView.ScrollToEnd()
-		fmt.Fprintf(textView, "%s", line)
+		fmt.Fprintf(logView, "%s", line)
+		logView.ScrollToEnd()
 	}
 	setSettings := func(s utils.SessionSettings) {
 		settings = s

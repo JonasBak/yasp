@@ -57,10 +57,9 @@ type remoteForwardChannelData struct {
 }
 
 type session struct {
-	conn      *gossh.ServerConn
-	pipeR     *os.File
-	pipeW     *os.File
-	subdomain string
+	conn  *gossh.ServerConn
+	pipeR *os.File
+	pipeW *os.File
 
 	settings utils.SessionSettings
 
@@ -113,7 +112,8 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		subdomain := reqPayload.BindAddr
 
 		pipeR, pipeW, _ := os.Pipe()
-		settings := utils.DefaultSettings()
+
+		settings := utils.DefaultSettingsWithSubdomain(subdomain)
 
 		go func() {
 			<-ctx.Done()
@@ -124,9 +124,9 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 				session.pipeW.Close()
 				delete(h.sessions, sessionID)
 				delete(h.onCreate, sessionID)
-				subdomainSession, ok := h.subdomains[session.subdomain]
+				subdomainSession, ok := h.subdomains[session.settings.Subdomain]
 				if ok && subdomainSession == sessionID {
-					delete(h.subdomains, session.subdomain)
+					delete(h.subdomains, session.settings.Subdomain)
 				}
 			}
 			log.Printf("cleaned up after %s", sessionID)
@@ -140,7 +140,6 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			conn,
 			pipeR,
 			pipeW,
-			subdomain,
 			settings,
 			[]error{},
 		}
@@ -168,7 +167,11 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			session.pipeR.Close()
 			session.pipeW.Close()
 			delete(h.sessions, sessionID)
-			delete(h.subdomains, session.subdomain)
+			delete(h.onCreate, sessionID)
+			subdomainSession, ok := h.subdomains[session.settings.Subdomain]
+			if ok && subdomainSession == sessionID {
+				delete(h.subdomains, session.settings.Subdomain)
+			}
 		}
 		h.Unlock()
 		return true, nil
@@ -233,7 +236,7 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	originAddr, orignPortStr, _ := net.SplitHostPort(r.RemoteAddr)
 	originPort, _ := strconv.Atoi(orignPortStr)
 	payload := gossh.Marshal(&remoteForwardChannelData{
-		DestAddr:   session.subdomain,
+		DestAddr:   session.settings.Subdomain,
 		DestPort:   uint32(80),
 		OriginAddr: originAddr,
 		OriginPort: uint32(originPort),
@@ -382,6 +385,11 @@ func main() {
 		return
 	}
 
+	serviceURL := os.Getenv("SERVICE_URL")
+	if serviceURL == "" {
+		serviceURL = "localhost:8080"
+	}
+
 	publicKeyHandler := getPublicKeyHandler()
 	passwordHandler := getPasswordHandler()
 
@@ -444,7 +452,7 @@ func main() {
 				return
 			}
 
-			cmd := exec.Command(os.Args[0], "--tui", "--forward-url", session.subdomain)
+			cmd := exec.Command(os.Args[0], "--tui", "--service-url", serviceURL)
 			cmd.ExtraFiles = []*os.File{
 				session.pipeR,
 			}
