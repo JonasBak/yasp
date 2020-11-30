@@ -57,22 +57,29 @@ func setSettings(s utils.SessionSettings) {
 func Run() {
 	app := tview.NewApplication()
 
-	settings := utils.SessionSettings{}
+	settings := utils.DefaultSettings()
+
+	blockCheckbox := tview.NewCheckbox().SetLabel("Block traffic").SetChecked(settings.Block).SetChangedFunc(func(c bool) {
+		s := settings
+		if s.Block != c {
+			s.Block = c
+			setSettings(s)
+		}
+	})
+	passwordField := tview.NewInputField().SetMaskCharacter('*').SetLabel("Password").SetText(settings.Password).SetFieldWidth(10).SetChangedFunc(func(p string) {
+		s := settings
+		if s.Password != p {
+			s.Password = p
+			setSettings(s)
+		}
+	})
 
 	settingsView := tview.NewForm().
 		SetItemPadding(1).
 		SetLabelColor(tcell.ColorWhite).
 		SetFieldBackgroundColor(tcell.ColorGray).
-		AddCheckbox("Block traffic", false, func(c bool) {
-			s := settings
-			s.Block = c
-			setSettings(s)
-		}).
-		AddPasswordField("Password", "", 10, '*', func(p string) {
-			s := settings
-			s.Password = p
-			setSettings(s)
-		})
+		AddFormItem(blockCheckbox).
+		AddFormItem(passwordField)
 
 	infoView := tview.NewTextView().
 		SetDynamicColors(true).
@@ -111,12 +118,18 @@ func Run() {
 		AddItem(logView, 1, 0, 2, 3, 0, 0, false)
 
 	pushLog := func(line string) {
-		fmt.Fprintf(logView, "%s", line)
-		logView.ScrollToEnd()
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(logView, "%s", line)
+			logView.ScrollToEnd()
+		})
 	}
 	setSettings := func(s utils.SessionSettings) {
 		settings = s
-		setStatusText()
+		app.QueueUpdateDraw(func() {
+			blockCheckbox.SetChecked(s.Block)
+			passwordField.SetText(s.Password)
+			setStatusText()
+		})
 	}
 
 	if !*mock {

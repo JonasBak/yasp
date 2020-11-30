@@ -369,7 +369,7 @@ func readMessages(stderr io.ReadCloser, setSettings func(utils.SessionSettings))
 					setSettings(settings)
 				}
 			} else {
-				log.Println("could not parse last message")
+				log.Printf("could not parse last message: %s", lineStr)
 			}
 		}
 		if err == io.EOF {
@@ -441,6 +441,12 @@ func main() {
 
 			if !isPty {
 				session.pushError(fmt.Errorf("Forwarding without pty is not allowed yet"))
+			}
+
+			if s, err := utils.ParseSettings(session.settings, isPty, s.Command()); err != nil {
+				session.pushError(err)
+			} else {
+				session.settings = s
 			}
 
 			if len(session.errors) > 0 {
