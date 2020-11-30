@@ -25,6 +25,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 	"unsafe"
 )
 
@@ -62,6 +63,12 @@ type session struct {
 	subdomain string
 
 	settings utils.SessionSettings
+
+	errors []error
+}
+
+func (s *session) pushError(err error) {
+	s.errors = append(s.errors, err)
 }
 
 type forwardedTCPHandler struct {
@@ -90,6 +97,9 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		h.onCreate[sessionID] = onCreate
 	}
 	h.Unlock()
+
+	defer func() { onCreate <- struct{}{} }()
+
 	conn := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn)
 
 	switch req.Type {
@@ -99,27 +109,12 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			// TODO: log parse failure
 			return false, []byte{}
 		}
-		if srv.ReversePortForwardingCallback == nil {
-			return false, []byte("port forwarding is disabled")
-		}
-		if !srv.ReversePortForwardingCallback(ctx, reqPayload.BindAddr, reqPayload.BindPort) {
-			return false, []byte("port forwarding failed")
-		}
+
 		subdomain := reqPayload.BindAddr
 
 		pipeR, pipeW, _ := os.Pipe()
 		settings := utils.DefaultSettings()
 
-		h.Lock()
-		h.sessions[sessionID] = &session{
-			conn,
-			pipeR,
-			pipeW,
-			subdomain,
-			settings,
-		}
-		h.subdomains[subdomain] = sessionID
-		h.Unlock()
 		go func() {
 			<-ctx.Done()
 			h.Lock()
@@ -128,17 +123,38 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 				session.pipeR.Close()
 				session.pipeW.Close()
 				delete(h.sessions, sessionID)
-				delete(h.subdomains, subdomain)
+				delete(h.onCreate, sessionID)
+				subdomainSession, ok := h.subdomains[session.subdomain]
+				if ok && subdomainSession == sessionID {
+					delete(h.subdomains, session.subdomain)
+				}
 			}
 			log.Printf("cleaned up after %s", sessionID)
 			h.Unlock()
 		}()
 
-		destPort := reqPayload.BindPort
+		h.Lock()
+		defer h.Unlock()
 
-		onCreate <- struct{}{}
+		s := session{
+			conn,
+			pipeR,
+			pipeW,
+			subdomain,
+			settings,
+			[]error{},
+		}
 
-		return true, gossh.Marshal(&remoteForwardSuccess{uint32(destPort)})
+		h.sessions[sessionID] = &s
+
+		if err := h.ReversePortForwardingCallback(ctx, subdomain, reqPayload.BindPort); err != nil {
+			s.pushError(err)
+			return false, []byte("port forwarding failed")
+		}
+
+		h.subdomains[subdomain] = sessionID
+
+		return true, gossh.Marshal(&remoteForwardSuccess{reqPayload.BindPort})
 
 	case "cancel-tcpip-forward":
 		var reqPayload remoteForwardCancelRequest
@@ -161,12 +177,21 @@ func (h *forwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 	}
 }
 
-func (h *forwardedTCPHandler) ReversePortForwardingCallback(ctx ssh.Context, host string, port uint32) bool {
-	_, exists := h.subdomains[host]
-	if exists {
-		return false
+func (h *forwardedTCPHandler) ReversePortForwardingCallback(ctx ssh.Context, subdomain string, port uint32) error {
+	if port != 80 {
+		return fmt.Errorf("Port must be 80 for http forwarding")
 	}
-	return true
+
+	for _, r := range subdomain {
+		if !unicode.IsLetter(r) {
+			return fmt.Errorf("Subdomain can only contain letters")
+		}
+	}
+	_, exists := h.subdomains[subdomain]
+	if exists {
+		return fmt.Errorf("Subdomain '%s' already taken", subdomain)
+	}
+	return nil
 }
 
 func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Request) {
@@ -196,8 +221,7 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	if correctPass := session.settings.Password; len(correctPass) > 0 {
 		user, pass, ok := r.BasicAuth()
 		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte("yasp")) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(correctPass)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Basic realm="yeet"`)
-			w.WriteHeader(401)
+			w.Header().Set("WWW-Authenticate", `Basic realm="Authentication is enabled for this session"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 
 			fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - [yellow]unauthorized[white]\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path)
@@ -210,14 +234,18 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	originPort, _ := strconv.Atoi(orignPortStr)
 	payload := gossh.Marshal(&remoteForwardChannelData{
 		DestAddr:   session.subdomain,
-		DestPort:   uint32(1232),
+		DestPort:   uint32(80),
 		OriginAddr: originAddr,
 		OriginPort: uint32(originPort),
 	})
 
 	ch, reqs, err := session.conn.OpenChannel(forwardedTCPChannelType, payload)
 	if err != nil {
-		panic(err)
+		http.Error(w, "could not connect to upstream", http.StatusBadGateway)
+
+		fmt.Fprintf(session.pipeW, "%s[red]ERROR[white] upstream: %s\n", utils.LOG_MSG_PREFIX, err.Error())
+
+		return
 	}
 	defer ch.Close()
 
@@ -228,10 +256,15 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 		buf := bytes.NewReader(dump)
 		io.Copy(ch, buf)
 	}()
+
 	buf := bufio.NewReader(ch)
 	resp, err := http.ReadResponse(buf, r)
 	if err != nil {
-		panic(err)
+		http.Error(w, "could not parse upstream", http.StatusBadGateway)
+
+		fmt.Fprintf(session.pipeW, "%s[red]ERROR[white] upstream: %s\n", utils.LOG_MSG_PREFIX, err.Error())
+
+		return
 	}
 
 	fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - %d\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path, resp.StatusCode)
@@ -377,13 +410,10 @@ func main() {
 		Addr: ":2222",
 		Handler: ssh.Handler(func(s ssh.Session) {
 			ptyReq, winCh, isPty := s.Pty()
-			if !isPty {
-				io.WriteString(s, "No PTY requested.\n")
-				s.Exit(1)
-			}
 
 			sessionID := s.Context().(ssh.Context).SessionID()
 			log.Printf("started session for %s - %s", s.User(), sessionID)
+			defer log.Printf("ended session for %s - %s", s.User(), sessionID)
 
 			forwardHandler.Lock()
 			if forwardHandler.onCreate == nil {
@@ -400,6 +430,19 @@ func main() {
 			<-onCreate
 
 			session, _ := forwardHandler.sessions[sessionID]
+
+			if !isPty {
+				session.pushError(fmt.Errorf("Forwarding without pty is not allowed yet"))
+			}
+
+			if len(session.errors) > 0 {
+				fmt.Fprintln(s, "Failed to connect:")
+				for _, err := range session.errors {
+					fmt.Fprintln(s, err.Error())
+				}
+				s.Exit(1)
+				return
+			}
 
 			cmd := exec.Command(os.Args[0], "--tui", "--forward-url", session.subdomain)
 			cmd.ExtraFiles = []*os.File{
@@ -435,9 +478,7 @@ func main() {
 			}()
 			io.Copy(s, f) // stdout
 			s.Exit(0)
-			log.Printf("ended session for %s - %s", s.User(), sessionID)
 		}),
-		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(forwardHandler.ReversePortForwardingCallback),
 		RequestHandlers: map[string]ssh.RequestHandler{
 			"tcpip-forward":        forwardHandler.HandleSSHRequest,
 			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
