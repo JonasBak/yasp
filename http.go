@@ -73,9 +73,10 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 	go gossh.DiscardRequests(reqs)
 
 	go func() {
-		dump, _ := httputil.DumpRequest(r, true)
+		dump, _ := httputil.DumpRequest(r, false)
 		buf := bytes.NewReader(dump)
 		io.Copy(ch, buf)
+		io.Copy(ch, r.Body)
 	}()
 
 	buf := bufio.NewReader(ch)

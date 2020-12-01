@@ -1,0 +1,19 @@
+name: Build and push docker image
+on:
+  push:
+    branches: [master]
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v2
+      - name: Push to GitHub Packages
+        uses: docker/build-push-action@v1
+        with:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: docker.pkg.github.com
+          repository: jonasbak/yasp/yasp
+          tag_with_ref: true
+          tag_with_sha: true
