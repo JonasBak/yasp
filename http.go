@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/subtle"
 	"fmt"
 	"github.com/jonasbak/yasp/utils"
@@ -10,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"strconv"
 	"strings"
 )
@@ -72,30 +70,61 @@ func (h *forwardedTCPHandler) httpMuxHandler(w http.ResponseWriter, r *http.Requ
 
 	go gossh.DiscardRequests(reqs)
 
-	go func() {
-		dump, _ := httputil.DumpRequest(r, false)
-		buf := bytes.NewReader(dump)
-		io.Copy(ch, buf)
-		io.Copy(ch, r.Body)
-	}()
+	isWs := isWsRequest(r)
 
-	buf := bufio.NewReader(ch)
-	resp, err := http.ReadResponse(buf, r)
-	if err != nil {
-		http.Error(w, "could not parse upstream", http.StatusBadGateway)
-
-		fmt.Fprintf(session.pipeW, "%s[red]ERROR[white] upstream: %s\n", utils.LOG_MSG_PREFIX, err.Error())
-
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "", http.StatusInternalServerError)
+		fmt.Fprintf(session.pipeW, "%s[red]ERROR[white] not able to hijack connection\n", utils.LOG_MSG_PREFIX)
 		return
 	}
 
-	fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - %d\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path, resp.StatusCode)
-
-	for h, vals := range resp.Header {
-		for _, val := range vals {
-			w.Header().Add(h, val)
-		}
+	nc, _, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, "", http.StatusInternalServerError)
+		fmt.Fprintf(session.pipeW, "%s[red]ERROR[white] not able to hijack connection: %s\n", utils.LOG_MSG_PREFIX, err.Error())
+		return
 	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	defer nc.Close()
+
+	go func() {
+		r.Write(ch)
+		if isWs {
+			io.Copy(ch, nc)
+			ch.Close()
+		}
+	}()
+
+	if isWs {
+		fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - websocket\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path)
+
+		io.Copy(nc, ch)
+	} else {
+		buf := bufio.NewReader(ch)
+		resp, err := http.ReadResponse(buf, r)
+		if err != nil {
+			http.Error(w, "could not parse upstream", http.StatusBadGateway)
+
+			fmt.Fprintf(session.pipeW, "%s[red]ERROR[white] upstream: %s\n", utils.LOG_MSG_PREFIX, err.Error())
+
+			return
+		}
+
+		fmt.Fprintf(session.pipeW, "%s%s - %s %s %s - %d\n", utils.LOG_MSG_PREFIX, r.RemoteAddr, r.Method, r.Host, r.URL.Path, resp.StatusCode)
+
+		resp.Write(nc)
+	}
+}
+
+func isWsRequest(r *http.Request) bool {
+	contains := func(key, val string) bool {
+		vs := strings.Split(r.Header.Get(key), ",")
+		for _, v := range vs {
+			if val == strings.ToLower(strings.TrimSpace(v)) {
+				return true
+			}
+		}
+		return false
+	}
+	return contains("Connection", "upgrade") && contains("Upgrade", "websocket")
 }
